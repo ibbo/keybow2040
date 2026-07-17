@@ -21,6 +21,13 @@ Set PEDAL_CONTROLS_LOOPER = False to give the pedal back to synth sustain.
 Knob C1 sets the focused track's playback volume, C2 the synth volume;
 other knobs' CC numbers are logged so they can be mapped here.
 
+Saving: every run writes an always-on tape of the full performance (loops,
+synth AND the live input) to recordings/<timestamp>/tape.wav — the take you
+didn't know you wanted is already captured. Tap key 14 to bounce the
+current loops: one aligned WAV stem per track plus a mixdown, in the same
+session folder. The tape's WAV header is refreshed as it grows, so even a
+hard kill leaves a playable file.
+
 Keys 4-7 mute/unmute tracks 0-3 (the neighbouring key). Muting keeps the
 loop and its phase, so unmuting drops back in exactly in time; the track
 key blinks dim green while muted and its mute key lights solid blue.
@@ -39,9 +46,13 @@ looped keys time-aligned with looped audio-input material.
 Run:  .venv/bin/python looper.py   (stop keybowd first; they share the serial port)
 """
 
+import atexit
 import glob
+import os
 import queue
 import re
+import signal
+import struct
 import sys
 import time
 
@@ -61,6 +72,9 @@ CLEAR_ALL_KEY = 15
 MIDI_PORT_MATCH = "A-Series"
 
 TRIGGER_LEVEL = 0.04       # input peak that fires an armed track
+SAVE_KEY = 14              # tap to bounce the current loops to WAV files
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "recordings")
 PEDAL_CONTROLS_LOOPER = True
 CC_PEDAL = 64              # A-49 HOLD jack
 CC_TRACK_VOL = 74          # knob C1 (default assignment)
@@ -109,6 +123,7 @@ class Looper:
         self.focus = 0             # track the pedal and volume knob act on
         self.synth_vol = 1.0
         self.cc_log = queue.SimpleQueue()   # unmapped CC numbers, for the log
+        self.tape_q = queue.SimpleQueue()   # output+live blocks for the tape
         self._pedal_down = False
         self.xruns = 0
         self._mix = np.zeros(BLOCK, dtype=np.float32)
@@ -257,7 +272,8 @@ class Looper:
         fifo[:-frames] = fifo[frames:]
         fifo[-frames:] = synth_out
 
-        rec_src = indata[:, 0] + indata[:, 1] + synth_delayed
+        mono_raw = indata[:, 0] + indata[:, 1]
+        rec_src = mono_raw + synth_delayed
         mix = self._mix
         mix[:] = 0.0
 
@@ -300,6 +316,94 @@ class Looper:
         np.clip(mix, -1.0, 1.0, out=mix)
         outdata[:, 0] = mix
         outdata[:, 1] = mix
+        # The tape hears what the room hears: our output plus the live
+        # (direct-monitored) input. `mix + mono_raw` allocates the fresh
+        # array the queue needs.
+        self.tape_q.put(mix + mono_raw)
+
+
+# -- saving ----------------------------------------------------------------
+
+
+class WavWriter:
+    """Minimal mono 16-bit WAV writer whose header can be refreshed while
+    writing, so a hard kill still leaves a playable file."""
+
+    def __init__(self, path):
+        self.f = open(path, "wb")
+        self.frames = 0
+        self.f.write(self._header())
+
+    def _header(self):
+        data_bytes = self.frames * 2
+        return (b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVEfmt "
+                + struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE,
+                              SAMPLE_RATE * 2, 2, 16)
+                + b"data" + struct.pack("<I", data_bytes))
+
+    def write(self, block):
+        pcm = (np.clip(block, -1.0, 1.0) * 32767).astype("<i2")
+        self.f.write(pcm.tobytes())
+        self.frames += len(pcm)
+
+    def flush_header(self):
+        pos = self.f.tell()
+        self.f.seek(0)
+        self.f.write(self._header())
+        self.f.seek(pos)
+        self.f.flush()
+
+    def close(self):
+        self.flush_header()
+        self.f.close()
+
+
+class SessionRecorder:
+    """One folder per looper run: an always-on performance tape, plus
+    on-demand bounces of the current loops."""
+
+    def __init__(self, base=RECORDINGS_DIR):
+        self.dir = os.path.join(base, time.strftime("%Y-%m-%d_%H%M%S"))
+        os.makedirs(self.dir, exist_ok=True)
+        self.tape = WavWriter(os.path.join(self.dir, "tape.wav"))
+        self._last_flush = time.time()
+
+    def drain_tape(self, q):
+        wrote = False
+        while True:
+            try:
+                self.tape.write(q.get_nowait())
+                wrote = True
+            except queue.Empty:
+                break
+        if wrote and time.time() - self._last_flush > 5.0:
+            self.tape.flush_header()
+            self._last_flush = time.time()
+
+    def bounce(self, looper):
+        """Write one stem per non-empty track plus a mixdown of what's
+        audible. Stems are rolled onto the master timeline so they line up
+        when imported together. Returns (folder, n_stems) or None."""
+        tracks = [(i, t) for i, t in enumerate(looper.tracks) if t.length]
+        if not tracks:
+            return None
+        stamp = time.strftime("%H%M%S")
+        mix_len = max(t.length for _, t in tracks)
+        mixdown = np.zeros(mix_len, dtype=np.float32)
+        for i, t in tracks:
+            data = np.roll(t.buf[:t.length].copy(), t.start_phase % t.length)
+            w = WavWriter(os.path.join(self.dir, f"bounce_{stamp}_track{i}.wav"))
+            w.write(data)
+            w.close()
+            if not t.muted:
+                mixdown += np.tile(data * t.volume, mix_len // t.length)
+        w = WavWriter(os.path.join(self.dir, f"bounce_{stamp}_mix.wav"))
+        w.write(mixdown)
+        w.close()
+        return self.dir, len(tracks)
+
+    def close(self):
+        self.tape.close()
 
 
 # -- keybow serial ---------------------------------------------------------
@@ -326,6 +430,11 @@ def main():
         f"latency in={in_lat * 1000:.1f}ms out={out_lat * 1000:.1f}ms "
         f"(compensating {looper.lat_samples} samples)")
 
+    recorder = SessionRecorder()
+    log(f"taping session to {os.path.join(recorder.dir, 'tape.wav')}")
+    signal.signal(signal.SIGTERM, lambda sig, frame: sys.exit(0))
+    atexit.register(recorder.close)
+
     midi_port = None
     midi_names = [n for n in mido.get_input_names() if MIDI_PORT_MATCH in n]
     if midi_names:
@@ -343,9 +452,11 @@ def main():
     seen_ccs = set()
     rxbuf = b""
     last_ping = 0.0
+    save_flash_until = 0.0
 
     while True:
         now = time.time()
+        recorder.drain_tape(looper.tape_q)
         if now - last_ping > 1.0:
             last_ping = now
             ser.write(b"PING\n")
@@ -370,6 +481,12 @@ def main():
                 if sent.get(key) != want:
                     ser.write(("L %d %d %d %d %d\n" % (key, *want)).encode())
                     sent[key] = want
+
+        save_led = ((0, 255, 60, MODE_SOLID) if now < save_flash_until
+                    else (16, 0, 20, MODE_SOLID))    # dim purple: save lives here
+        if sent.get(SAVE_KEY) != save_led:
+            ser.write(("L %d %d %d %d %d\n" % (SAVE_KEY, *save_led)).encode())
+            sent[SAVE_KEY] = save_led
 
         while True:
             try:
@@ -396,6 +513,14 @@ def main():
                 looper.tap(n) if ev == "P" else looper.clear(n)
             elif MUTE_KEY_OFFSET <= n < MUTE_KEY_OFFSET + N_TRACKS and ev == "P":
                 looper.toggle_mute(n - MUTE_KEY_OFFSET)
+            elif n == SAVE_KEY and ev == "P":
+                result = recorder.bounce(looper)
+                if result:
+                    folder, n_stems = result
+                    log(f"bounced {n_stems} track(s) + mix to {folder}")
+                    save_flash_until = time.time() + 0.7
+                else:
+                    log("bounce: nothing recorded yet")
             elif n == CLEAR_ALL_KEY and ev == "H":
                 log("clear all")
                 looper.clear_all()

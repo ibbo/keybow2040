@@ -81,6 +81,18 @@ of it, so longer phrases work naturally. Muted tracks (blinking dim green,
 mute key solid blue) keep spinning silently in phase, so they come back
 exactly in time; (un)mutes are ramped over one audio block to avoid clicks.
 
+### Saving
+
+Every looper run tapes the full performance — loops, synth *and* the live
+(direct-monitored) input — to `recordings/<timestamp>/tape.wav`, so the take
+you didn't know you wanted is already captured. Tap **key 14** (dim purple;
+flashes green on save) to bounce the current loops: one WAV stem per track,
+rolled onto the master timeline so they line up in a DAW, plus a mixdown of
+what's audible (muted tracks get a stem but stay out of the mix). The
+tape's WAV header is refreshed as it grows, so even a hard kill leaves a
+playable file; disk writes happen on the control thread, never the audio
+callback.
+
 ### MIDI keyboard (Roland A-series)
 
 If a MIDI input matching `MIDI_PORT_MATCH` is present, it plays a built-in
