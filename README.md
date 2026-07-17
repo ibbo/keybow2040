@@ -64,24 +64,41 @@ device). Use the interface's Direct Monitor to hear yourself — the looper
 only plays back loops.
 
 ```sh
-pip install sounddevice numpy   # in the same venv
+pip install sounddevice numpy mido python-rtmidi   # in the same venv
 .venv/bin/python looper.py      # stop keybowd first: they share the serial port
 ```
 
 Layout: keys 0–3 are loop tracks, keys 4–7 mute/unmute the neighbouring
 track, hold key 15 to clear everything.
 
-Per track: tap to record (pulsing red), tap to close the loop and play
-(green), tap to overdub (pulsing orange), tap to return to play; hold to
-clear. The first loop sets the master length; later recordings are rounded
-to the nearest whole multiple of it, so longer phrases work naturally.
-Muted tracks (blinking dim green, mute key solid blue) keep spinning
-silently in phase, so they come back exactly in time; (un)mutes are ramped
-over one audio block to avoid clicks.
+Per track: tap to **arm** (blinking red) — recording starts, sample-tight,
+the moment the input crosses `TRIGGER_LEVEL`, so there's no dead air while
+you get back to your instrument (tap an armed track to force an immediate
+start). Tap to close the loop and play (green), tap to overdub (pulsing
+orange), tap to return to play; hold to clear. The first loop sets the
+master length; later recordings are rounded to the nearest whole multiple
+of it, so longer phrases work naturally. Muted tracks (blinking dim green,
+mute key solid blue) keep spinning silently in phase, so they come back
+exactly in time; (un)mutes are ramped over one audio block to avoid clicks.
+
+### MIDI keyboard (Roland A-series)
+
+If a MIDI input matching `MIDI_PORT_MATCH` is present, it plays a built-in
+polyphonic synth (`synth.py`: two detuned saws per voice, exponential
+envelope, pitch bend) mixed into the output and into whatever is recording —
+loops can hold audio-interface input, keys, or both. A pedal in the HOLD
+jack is a hands-free tap on the *focused* track (last track key touched;
+brighter white when empty), knob C1 (CC 74) is the focused track's playback
+volume, C2 (CC 71) the synth volume; unmapped CCs are logged so other
+controllers can be wired up. Set `PEDAL_CONTROLS_LOOPER = False` to give
+the pedal back to synth sustain.
 
 Engineering notes: audio runs in a PortAudio duplex callback
-(`sounddevice`, 256-sample blocks, `latency="low"`) with all loop state
-owned by the callback thread — the control thread posts commands via a
-queue and reads state for the LEDs. Overdubs are shifted earlier by the
-stream's reported round-trip latency (~33&nbsp;ms measured) so layers land
-where you played them, not where the samples arrived.
+(`sounddevice`, 128-sample blocks, `latency="low"`) with all loop state
+owned by the callback thread — the control thread and MIDI thread post
+commands/messages via queues and read state back for the LEDs. Recorded
+material is shifted earlier by the stream's reported round-trip latency
+(~24&nbsp;ms measured) so layers land where you played them, not where the
+samples arrived; the synth's recording feed is delayed by the same amount
+(it needs no mic-path shift), keeping looped keys and looped strings in
+the same groove.
