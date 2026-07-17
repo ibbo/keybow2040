@@ -7,6 +7,7 @@
 #                    CLR                          all LEDs off
 #                    PING                         keepalive (any command counts)
 #   keybow -> host:  P <key>                      key was pressed
+#                    H <key>                      key held >0.75s (fires after its P)
 #                    PONG                         reply to PING
 #
 # If the host goes quiet for 10s, all keys show a slow dim amber breathe
@@ -40,8 +41,15 @@ def make_press_handler(n):
     return handler
 
 
+def make_hold_handler(n):
+    def handler(key):
+        print("H %d" % n)
+    return handler
+
+
 for i, k in enumerate(keys):
     keybow.on_press(k, make_press_handler(i))
+    keybow.on_hold(k, make_hold_handler(i))
 
 
 def handle_line(line):

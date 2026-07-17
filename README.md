@@ -1,7 +1,8 @@
-# Keybow 2040 AI session switcher
+# Keybow 2040 AI session switcher (and live looper)
 
 Turns a [Pimoroni Keybow 2040](https://shop.pimoroni.com/products/keybow-2040) into a
-status display and switcher for AI assistant sessions:
+status display and switcher for AI assistant sessions — plus, sharing the same
+firmware, a standalone live audio looper (`looper.py`, see below):
 
 - Each key maps to a session; its LED shows status:
   - **off** — session not running
@@ -54,3 +55,33 @@ python3 -m venv .venv
 
 The daemon finds the Keybow at `/dev/cu.usbmodem*` automatically and
 reconnects if it's unplugged.
+
+## Live looper
+
+`looper.py` turns the Keybow into a 4-track live looper for an audio
+interface (built against a Focusrite Scarlett Solo; uses the default audio
+device). Use the interface's Direct Monitor to hear yourself — the looper
+only plays back loops.
+
+```sh
+pip install sounddevice numpy   # in the same venv
+.venv/bin/python looper.py      # stop keybowd first: they share the serial port
+```
+
+Layout: keys 0–3 are loop tracks, keys 4–7 mute/unmute the neighbouring
+track, hold key 15 to clear everything.
+
+Per track: tap to record (pulsing red), tap to close the loop and play
+(green), tap to overdub (pulsing orange), tap to return to play; hold to
+clear. The first loop sets the master length; later recordings are rounded
+to the nearest whole multiple of it, so longer phrases work naturally.
+Muted tracks (blinking dim green, mute key solid blue) keep spinning
+silently in phase, so they come back exactly in time; (un)mutes are ramped
+over one audio block to avoid clicks.
+
+Engineering notes: audio runs in a PortAudio duplex callback
+(`sounddevice`, 256-sample blocks, `latency="low"`) with all loop state
+owned by the callback thread — the control thread posts commands via a
+queue and reads state for the LEDs. Overdubs are shifted earlier by the
+stream's reported round-trip latency (~33&nbsp;ms measured) so layers land
+where you played them, not where the samples arrived.
